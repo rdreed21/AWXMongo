@@ -1,0 +1,606 @@
+---
+- name: Performance Tune Percona MongoDB Cluster
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    mongodb_namespace: percona-mongo
+    cluster_name: mongo-cluster
+    
+    # Tuning Profile Selection
+    tuning_profile: balanced  # Options: balanced, throughput, latency, memory_optimized
+    
+    # WiredTiger Cache Configuration
+    wiredtiger_cache_size_gb: ""  # Auto-calculate if empty, or specify (e.g., "4")
+    wiredtiger_cache_size_ratio: 0.5  # 50% of pod memory if auto
+    
+    # Connection Pool Settings
+    max_connections: 65536
+    max_incoming_connections: 65536
+    
+    # OpLog Settings (for replication)
+    oplog_size_mb: 2048  # 2GB default, increase for high write loads
+    
+    # Index Build Settings
+    max_index_build_memory_mb: 500
+    
+    # Query Settings
+    internal_query_max_blocking_sort_memory_mb: 100
+    max_blocking_sort_memory_mb: 33554432  # 32MB in bytes
+    
+    # Network Settings
+    net_max_incoming_connections: 65536
+    net_service_executor: "adaptive"  # adaptive or synchronous
+    
+    # Storage Engine Settings
+    storage_engine: "wiredTiger"
+    journal_commit_interval_ms: 100
+    
+    # Security Settings
+    security_authorization: "enabled"
+    
+    # Profiling Settings (0=off, 1=slow, 2=all)
+    enable_profiling: false
+    profiling_level: 1  # 0, 1, or 2
+    profiling_slow_ms: 100  # Log queries slower than this
+    
+    # Resource Adjustments
+    adjust_resources: false
+    new_cpu_limit: ""
+    new_memory_limit: ""
+    new_cpu_request: ""
+    new_memory_request: ""
+    
+    # Sharding Optimization
+    optimize_chunk_size: false
+    chunk_size_mb: 64  # Default is 64MB
+    
+    # Balancer Settings
+    balancer_active_window_start: "01:00"
+    balancer_active_window_end: "05:00"
+    enable_auto_split: true
+    
+    # Read/Write Concern Optimization
+    default_read_concern: "local"  # local, available, majority, linearizable
+    default_write_concern: "1"  # 1, majority, or number
+    
+    # Index optimization
+    rebuild_indexes: false
+    analyze_slow_queries: true
+    
+  tasks:
+    - name: Get current cluster configuration
+      kubernetes.core.k8s_info:
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: current_cluster
+      failed_when: current_cluster.resources | length == 0
+    
+    - name: Extract current settings
+      set_fact:
+        current_cluster_state: "{{ current_cluster.resources[0].status.state | default('unknown') }}"
+        current_replsets: "{{ current_cluster.resources[0].spec.replsets }}"
+        current_shards_count: "{{ current_cluster.resources[0].spec.replsets | length }}"
+    
+    - name: Check cluster is ready
+      fail:
+        msg: "Cluster is not ready. Current state: {{ current_cluster_state }}"
+      when: current_cluster_state != 'ready'
+    
+    - name: Load tuning profile
+      set_fact:
+        tuning_params: "{{ lookup('vars', 'profile_' + tuning_profile) }}"
+      vars:
+        profile_balanced:
+          description: "Balanced profile for general workloads"
+          wiredtiger_cache_ratio: 0.5
+          max_connections: 65536
+          journal_commit_interval: 100
+          chunk_size: 64
+          net_service_executor: "adaptive"
+        
+        profile_throughput:
+          description: "Optimized for high throughput writes"
+          wiredtiger_cache_ratio: 0.6
+          max_connections: 100000
+          journal_commit_interval: 50
+          chunk_size: 128
+          net_service_executor: "adaptive"
+        
+        profile_latency:
+          description: "Optimized for low latency reads"
+          wiredtiger_cache_ratio: 0.7
+          max_connections: 50000
+          journal_commit_interval: 100
+          chunk_size: 32
+          net_service_executor: "synchronous"
+        
+        profile_memory_optimized:
+          description: "Optimized for memory-constrained environments"
+          wiredtiger_cache_ratio: 0.3
+          max_connections: 10000
+          journal_commit_interval: 200
+          chunk_size: 64
+          net_service_executor: "adaptive"
+    
+    - name: Display tuning plan
+      debug:
+        msg:
+          - "=========================================="
+          - "MongoDB Performance Tuning Plan"
+          - "=========================================="
+          - "Cluster: {{ cluster_name }}"
+          - "Namespace: {{ mongodb_namespace }}"
+          - "Profile: {{ tuning_profile }}"
+          - "Profile Description: {{ tuning_params.description }}"
+          - ""
+          - "Tuning Parameters:"
+          - "  WiredTiger Cache Ratio: {{ tuning_params.wiredtiger_cache_ratio }}"
+          - "  Max Connections: {{ tuning_params.max_connections }}"
+          - "  Journal Commit Interval: {{ tuning_params.journal_commit_interval }}ms"
+          - "  Chunk Size: {{ tuning_params.chunk_size }}MB"
+          - "  Network Executor: {{ tuning_params.net_service_executor }}"
+          - ""
+          - "Additional Settings:"
+          - "  OpLog Size: {{ oplog_size_mb }}MB"
+          - "  Profiling: {{ enable_profiling }}"
+          - "  Adjust Resources: {{ adjust_resources }}"
+          - "  Optimize Chunk Size: {{ optimize_chunk_size }}"
+          - "=========================================="
+    
+    - name: Create MongoDB configuration ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ cluster_name }}-mongod-config"
+            namespace: "{{ mongodb_namespace }}"
+          data:
+            mongod.conf: |
+              # MongoDB Performance Tuning Configuration
+              # Generated by Ansible - Profile: {{ tuning_profile }}
+              
+              net:
+                maxIncomingConnections: {{ tuning_params.max_connections }}
+                serviceExecutor: {{ tuning_params.net_service_executor }}
+              
+              storage:
+                engine: {{ storage_engine }}
+                wiredTiger:
+                  engineConfig:
+                    journalCompressor: snappy
+                    directoryForIndexes: false
+                  collectionConfig:
+                    blockCompressor: snappy
+                  indexConfig:
+                    prefixCompression: true
+                journal:
+                  enabled: true
+                  commitIntervalMs: {{ tuning_params.journal_commit_interval }}
+              
+              operationProfiling:
+                mode: {{ 'off' if not enable_profiling else ('slowOp' if profiling_level == 1 else 'all') }}
+                slowOpThresholdMs: {{ profiling_slow_ms }}
+              
+              replication:
+                oplogSizeMB: {{ oplog_size_mb }}
+              
+              setParameter:
+                maxIndexBuildMemoryUsageMegabytes: {{ max_index_build_memory_mb }}
+                internalQueryMaxBlockingSortMemoryBytes: {{ max_blocking_sort_memory_mb }}
+                internalQueryExecMaxBlockingSortBytes: {{ max_blocking_sort_memory_mb }}
+    
+    - name: Apply configuration to cluster
+      kubernetes.core.k8s:
+        state: patched
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+        definition:
+          spec:
+            replsets: "{{ optimized_replsets }}"
+      vars:
+        optimized_replsets: |
+          {% set ns = namespace(replsets=[]) %}
+          {% for shard in current_replsets %}
+          {% set shard_config = {
+              'name': shard.name,
+              'size': shard.size,
+              'affinity': shard.affinity,
+              'podDisruptionBudget': shard.podDisruptionBudget,
+              'expose': shard.expose,
+              'resources': shard.resources,
+              'volumeSpec': shard.volumeSpec,
+              'nonvoting': shard.nonvoting,
+              'arbiter': shard.arbiter,
+              'configuration': '|\n' ~ lookup('template', 'mongod_config.j2') if false else shard.get('configuration', '')
+          } %}
+          {% if adjust_resources %}
+          {% set _ = shard_config.update({
+              'resources': {
+                'limits': {
+                  'cpu': new_cpu_limit if new_cpu_limit else shard.resources.limits.cpu,
+                  'memory': new_memory_limit if new_memory_limit else shard.resources.limits.memory
+                },
+                'requests': {
+                  'cpu': new_cpu_request if new_cpu_request else shard.resources.requests.cpu,
+                  'memory': new_memory_request if new_memory_request else shard.resources.requests.memory
+                }
+              }
+          }) %}
+          {% endif %}
+          {% set _ = ns.replsets.append(shard_config) %}
+          {% endfor %}
+          {{ ns.replsets }}
+      register: config_applied
+    
+    - name: Wait for configuration to apply
+      pause:
+        seconds: 15
+      when: config_applied.changed
+    
+    - name: Get mongos service for direct connection
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        name: "{{ cluster_name }}-mongos"
+        namespace: "{{ mongodb_namespace }}"
+      register: mongos_service
+    
+    - name: Create job to apply runtime settings
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: "{{ cluster_name }}-tuning-{{ ansible_date_time.epoch }}"
+            namespace: "{{ mongodb_namespace }}"
+          spec:
+            ttlSecondsAfterFinished: 300
+            template:
+              metadata:
+                labels:
+                  app: mongodb-tuning
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: mongo-tuning
+                    image: percona/percona-server-mongodb:8.0.12-4-multi
+                    command:
+                      - /bin/bash
+                      - -c
+                      - |
+                        set -e
+                        
+                        # Get credentials from secret
+                        MONGO_USER=$(cat /etc/mongodb-secret/MONGODB_CLUSTER_ADMIN_USER)
+                        MONGO_PASS=$(cat /etc/mongodb-secret/MONGODB_CLUSTER_ADMIN_PASSWORD)
+                        
+                        # Connect to mongos
+                        mongosh "mongodb://${MONGO_USER}:${MONGO_PASS}@{{ cluster_name }}-mongos:27017/admin" --eval '
+                        
+                        print("=== Applying MongoDB Performance Tuning ===");
+                        
+                        // Set profiling level
+                        {% if enable_profiling %}
+                        db.setProfilingLevel({{ profiling_level }}, { slowms: {{ profiling_slow_ms }} });
+                        print("Profiling enabled: level {{ profiling_level }}, slow threshold {{ profiling_slow_ms }}ms");
+                        {% else %}
+                        db.setProfilingLevel(0);
+                        print("Profiling disabled");
+                        {% endif %}
+                        
+                        // Configure balancer window for sharded cluster
+                        use config;
+                        db.settings.updateOne(
+                          { _id: "balancer" },
+                          { 
+                            $set: { 
+                              activeWindow: {
+                                start: "{{ balancer_active_window_start }}",
+                                stop: "{{ balancer_active_window_end }}"
+                              }
+                            }
+                          },
+                          { upsert: true }
+                        );
+                        print("Balancer window set: {{ balancer_active_window_start }} - {{ balancer_active_window_end }}");
+                        
+                        {% if optimize_chunk_size %}
+                        // Update chunk size
+                        use config;
+                        db.settings.updateOne(
+                          { _id: "chunksize" },
+                          { $set: { value: {{ chunk_size_mb }} } },
+                          { upsert: true }
+                        );
+                        print("Chunk size set to {{ chunk_size_mb }}MB");
+                        {% endif %}
+                        
+                        // Set default read/write concerns
+                        use admin;
+                        db.adminCommand({
+                          setDefaultRWConcern: 1,
+                          defaultReadConcern: { level: "{{ default_read_concern }}" },
+                          defaultWriteConcern: { w: "{{ default_write_concern }}" }
+                        });
+                        print("Read concern: {{ default_read_concern }}, Write concern: {{ default_write_concern }}");
+                        
+                        // Enable auto-split
+                        {% if enable_auto_split %}
+                        db.adminCommand({ enableSharding: "config" });
+                        print("Auto-split enabled");
+                        {% endif %}
+                        
+                        // Compact and rebuild indexes if requested
+                        {% if rebuild_indexes %}
+                        print("Note: Index rebuild requested but should be done manually per collection");
+                        print("Example: db.collection.reIndex()");
+                        {% endif %}
+                        
+                        print("=== Performance Tuning Applied Successfully ===");
+                        '
+                    volumeMounts:
+                      - name: mongodb-secret
+                        mountPath: /etc/mongodb-secret
+                        readOnly: true
+                volumes:
+                  - name: mongodb-secret
+                    secret:
+                      secretName: mongo-users-secret
+      register: tuning_job
+    
+    - name: Wait for tuning job to complete
+      kubernetes.core.k8s_info:
+        api_version: batch/v1
+        kind: Job
+        name: "{{ tuning_job.result.metadata.name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: job_status
+      until:
+        - job_status.resources | length > 0
+        - job_status.resources[0].status.succeeded is defined
+        - job_status.resources[0].status.succeeded > 0
+      retries: 30
+      delay: 10
+      when: tuning_job.changed
+    
+    - name: Get tuning job logs
+      kubernetes.core.k8s_log:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mongodb_namespace }}"
+        label_selectors:
+          - job-name={{ tuning_job.result.metadata.name }}
+      register: tuning_logs
+      when: tuning_job.changed
+      ignore_errors: true
+    
+    - name: Create performance analysis job
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: "{{ cluster_name }}-analysis-{{ ansible_date_time.epoch }}"
+            namespace: "{{ mongodb_namespace }}"
+          spec:
+            ttlSecondsAfterFinished: 300
+            template:
+              metadata:
+                labels:
+                  app: mongodb-analysis
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: mongo-analysis
+                    image: percona/percona-server-mongodb:8.0.12-4-multi
+                    command:
+                      - /bin/bash
+                      - -c
+                      - |
+                        set -e
+                        
+                        MONGO_USER=$(cat /etc/mongodb-secret/MONGODB_CLUSTER_ADMIN_USER)
+                        MONGO_PASS=$(cat /etc/mongodb-secret/MONGODB_CLUSTER_ADMIN_PASSWORD)
+                        
+                        mongosh "mongodb://${MONGO_USER}:${MONGO_PASS}@{{ cluster_name }}-mongos:27017/admin" --eval '
+                        
+                        print("=== MongoDB Performance Analysis ===");
+                        print("");
+                        
+                        // Current connections
+                        print("Current Connections:");
+                        printjson(db.serverStatus().connections);
+                        print("");
+                        
+                        // WiredTiger cache stats
+                        print("WiredTiger Cache Statistics:");
+                        var wt = db.serverStatus().wiredTiger;
+                        if (wt) {
+                          print("Cache size: " + (wt.cache["maximum bytes configured"] / 1024 / 1024 / 1024).toFixed(2) + " GB");
+                          print("Currently in cache: " + (wt.cache["bytes currently in the cache"] / 1024 / 1024 / 1024).toFixed(2) + " GB");
+                          print("Cache usage: " + ((wt.cache["bytes currently in the cache"] / wt.cache["maximum bytes configured"]) * 100).toFixed(2) + "%");
+                        }
+                        print("");
+                        
+                        // OpLog stats
+                        print("OpLog Information:");
+                        printjson(db.getReplicationInfo());
+                        print("");
+                        
+                        // Shard distribution
+                        print("Shard Distribution:");
+                        printjson(sh.status());
+                        print("");
+                        
+                        // Slow queries (if profiling enabled)
+                        {% if enable_profiling %}
+                        print("Recent Slow Queries:");
+                        db.system.profile.find().limit(10).sort({ ts: -1 }).forEach(printjson);
+                        {% endif %}
+                        
+                        print("=== Analysis Complete ===");
+                        '
+                    volumeMounts:
+                      - name: mongodb-secret
+                        mountPath: /etc/mongodb-secret
+                        readOnly: true
+                volumes:
+                  - name: mongodb-secret
+                    secret:
+                      secretName: mongo-users-secret
+      register: analysis_job
+      when: analyze_slow_queries | bool
+    
+    - name: Wait for analysis job to complete
+      kubernetes.core.k8s_info:
+        api_version: batch/v1
+        kind: Job
+        name: "{{ analysis_job.result.metadata.name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: analysis_status
+      until:
+        - analysis_status.resources | length > 0
+        - analysis_status.resources[0].status.succeeded is defined
+        - analysis_status.resources[0].status.succeeded > 0
+      retries: 30
+      delay: 10
+      when: analyze_slow_queries | bool
+      ignore_errors: true
+    
+    - name: Get analysis job logs
+      kubernetes.core.k8s_log:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mongodb_namespace }}"
+        label_selectors:
+          - job-name={{ analysis_job.result.metadata.name }}
+      register: analysis_logs
+      when: analyze_slow_queries | bool
+      ignore_errors: true
+    
+    - name: Display tuning results
+      debug:
+        msg:
+          - "=========================================="
+          - "Performance Tuning Complete"
+          - "=========================================="
+          - "Cluster: {{ cluster_name }}"
+          - "Profile Applied: {{ tuning_profile }}"
+          - ""
+          - "Applied Settings:"
+          - "  Max Connections: {{ tuning_params.max_connections }}"
+          - "  WiredTiger Cache Ratio: {{ tuning_params.wiredtiger_cache_ratio }}"
+          - "  Journal Commit Interval: {{ tuning_params.journal_commit_interval }}ms"
+          - "  Chunk Size: {{ tuning_params.chunk_size }}MB (if optimized)"
+          - "  Network Executor: {{ tuning_params.net_service_executor }}"
+          - "  OpLog Size: {{ oplog_size_mb }}MB"
+          - "  Profiling: {{ 'Enabled' if enable_profiling else 'Disabled' }}"
+          - ""
+          - "Balancer Configuration:"
+          - "  Active Window: {{ balancer_active_window_start }} - {{ balancer_active_window_end }}"
+          - "  Auto-Split: {{ enable_auto_split }}"
+          - ""
+          - "Read/Write Concerns:"
+          - "  Read Concern: {{ default_read_concern }}"
+          - "  Write Concern: {{ default_write_concern }}"
+          - ""
+          - "{% if tuning_logs is defined and tuning_logs.log is defined %}"
+          - "Tuning Job Output:"
+          - "{{ tuning_logs.log }}"
+          - "{% endif %}"
+          - ""
+          - "{% if analysis_logs is defined and analysis_logs.log is defined %}"
+          - "Performance Analysis:"
+          - "{{ analysis_logs.log }}"
+          - "{% endif %}"
+          - ""
+          - "Next Steps:"
+          - "  1. Monitor cluster performance for 24-48 hours"
+          - "  2. Check metrics in Grafana/PMM"
+          - "  3. Review slow query logs: db.system.profile.find()"
+          - "  4. Adjust chunk size if seeing balancer issues"
+          - "  5. Consider index optimization for slow queries"
+          - "  6. Monitor memory usage and adjust cache if needed"
+          - ""
+          - "Performance Testing Commands:"
+          - "  - Check current settings: db.serverStatus()"
+          - "  - View profiling data: db.system.profile.find().sort({ts:-1})"
+          - "  - Check shard balance: sh.status()"
+          - "  - View current ops: db.currentOp()"
+          - "  - Connection stats: db.serverStatus().connections"
+          - "=========================================="
+    
+    - name: Create tuning recommendations document
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ cluster_name }}-tuning-recommendations"
+            namespace: "{{ mongodb_namespace }}"
+            annotations:
+              tuning-date: "{{ ansible_date_time.iso8601 }}"
+              tuning-profile: "{{ tuning_profile }}"
+          data:
+            recommendations.md: |
+              # MongoDB Performance Tuning - {{ cluster_name }}
+              
+              Applied: {{ ansible_date_time.iso8601 }}
+              Profile: {{ tuning_profile }}
+              
+              ## Applied Configuration
+              
+              - Max Connections: {{ tuning_params.max_connections }}
+              - WiredTiger Cache: {{ tuning_params.wiredtiger_cache_ratio * 100 }}% of memory
+              - Journal Commit: {{ tuning_params.journal_commit_interval }}ms
+              - Network Executor: {{ tuning_params.net_service_executor }}
+              
+              ## Monitoring Recommendations
+              
+              1. **Monitor these metrics closely:**
+                 - Connection count (should stay below {{ tuning_params.max_connections * 0.8 | int }})
+                 - WiredTiger cache hit ratio (target >95%)
+                 - Replication lag (should be <1 second)
+                 - Query execution time (p95, p99)
+              
+              2. **Performance baselines:**
+                 - Run performance tests during off-peak hours
+                 - Establish baseline metrics before major changes
+                 - Document query patterns and their performance
+              
+              3. **Optimization opportunities:**
+                 - Review indexes for frequently slow queries
+                 - Consider sharding key optimization
+                 - Evaluate chunk distribution across shards
+                 - Monitor balancer impact on performance
+              
+              ## Tuning Adjustments
+              
+              If experiencing:
+              - **High connection usage**: Increase max_connections or implement connection pooling
+              - **Memory pressure**: Reduce cache ratio or increase pod memory
+              - **Slow writes**: Decrease journal commit interval or optimize write concern
+              - **Balancer impact**: Adjust balancer window to off-peak hours
+              - **Slow reads**: Increase cache size or add indexes
+              
+              ## Profile Comparison
+              
+              - **Balanced**: General purpose, good starting point
+              - **Throughput**: High write loads, batch processing
+              - **Latency**: Real-time apps, user-facing queries
+              - **Memory Optimized**: Resource-constrained environments
+              
+              ## Next Review
+              
+              Schedule next tuning review: {{ (ansible_date_time.epoch | int + 2592000) | strftime('%Y-%m-%d') }}
+              (30 days from now)

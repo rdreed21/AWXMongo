@@ -1,0 +1,466 @@
+---
+- name: Setup Production Monitoring for Percona MongoDB
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    mongodb_namespace: percona-mongo-prod
+    cluster_name: mongo-cluster-prod
+    
+    # PMM (Percona Monitoring and Management) Configuration
+    enable_pmm: true
+    pmm_server_url: ""  # e.g., "https://pmm.example.com"
+    pmm_api_key: ""     # PMM API key for authentication
+    
+    # ServiceMonitor for Prometheus Operator
+    enable_servicemonitor: true
+    prometheus_namespace: openshift-monitoring
+    
+    # Grafana Dashboard
+    enable_grafana_dashboard: true
+    grafana_namespace: openshift-monitoring
+    
+    # AlertManager Rules
+    enable_alerts: true
+    alert_severity_critical: true
+    alert_severity_warning: true
+    
+    # Custom metrics endpoints
+    metrics_port: 9216
+    
+  tasks:
+    - name: Verify this is production namespace
+      fail:
+        msg: "Monitoring setup is only for production! Current namespace: {{ mongodb_namespace }}"
+      when: "'prod' not in mongodb_namespace"
+    
+    - name: Check if cluster exists
+      kubernetes.core.k8s_info:
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: cluster_check
+      failed_when: cluster_check.resources | length == 0
+    
+    - name: Display monitoring setup plan
+      debug:
+        msg:
+          - "=========================================="
+          - "Production Monitoring Setup"
+          - "=========================================="
+          - "Cluster: {{ cluster_name }}"
+          - "Namespace: {{ mongodb_namespace }}"
+          - ""
+          - "Components to Deploy:"
+          - "  PMM Integration: {{ enable_pmm }}"
+          - "  ServiceMonitor: {{ enable_servicemonitor }}"
+          - "  Grafana Dashboard: {{ enable_grafana_dashboard }}"
+          - "  Alert Rules: {{ enable_alerts }}"
+          - "=========================================="
+    
+    # PMM Setup
+    - name: Configure PMM monitoring
+      block:
+        - name: Validate PMM configuration
+          fail:
+            msg: "PMM server URL and API key must be provided"
+          when: pmm_server_url == "" or pmm_api_key == ""
+        
+        - name: Create PMM secret
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: pmm-secret
+                namespace: "{{ mongodb_namespace }}"
+              type: Opaque
+              stringData:
+                PMM_SERVER: "{{ pmm_server_url }}"
+                PMM_API_KEY: "{{ pmm_api_key }}"
+        
+        - name: Enable PMM in cluster
+          kubernetes.core.k8s:
+            state: patched
+            api_version: psmdb.percona.com/v1
+            kind: PerconaServerMongoDB
+            name: "{{ cluster_name }}"
+            namespace: "{{ mongodb_namespace }}"
+            definition:
+              spec:
+                pmm:
+                  enabled: true
+                  image: percona/pmm-client:2
+                  serverHost: "{{ pmm_server_url }}"
+                  resources:
+                    limits:
+                      cpu: "500m"
+                      memory: "512Mi"
+                    requests:
+                      cpu: "200m"
+                      memory: "256Mi"
+        
+        - debug:
+            msg: "✅ PMM monitoring enabled and configured"
+      when: enable_pmm | bool
+    
+    # ServiceMonitor for Prometheus
+    - name: Create ServiceMonitor for Prometheus Operator
+      block:
+        - name: Check if Prometheus Operator is available
+          kubernetes.core.k8s_info:
+            api_version: apiextensions.k8s.io/v1
+            kind: CustomResourceDefinition
+            name: servicemonitors.monitoring.coreos.com
+          register: prometheus_crd
+        
+        - name: Create ServiceMonitor
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: monitoring.coreos.com/v1
+              kind: ServiceMonitor
+              metadata:
+                name: "{{ cluster_name }}-mongodb"
+                namespace: "{{ mongodb_namespace }}"
+                labels:
+                  app: percona-mongodb
+                  cluster: "{{ cluster_name }}"
+              spec:
+                selector:
+                  matchLabels:
+                    app.kubernetes.io/instance: "{{ cluster_name }}"
+                    app.kubernetes.io/component: mongod
+                endpoints:
+                  - port: metrics
+                    interval: 30s
+                    path: /metrics
+                namespaceSelector:
+                  matchNames:
+                    - "{{ mongodb_namespace }}"
+          when: prometheus_crd.resources | length > 0
+        
+        - debug:
+            msg: "✅ ServiceMonitor created for Prometheus scraping"
+          when: prometheus_crd.resources | length > 0
+        
+        - debug:
+            msg: "⚠️  Prometheus Operator not found - ServiceMonitor not created"
+          when: prometheus_crd.resources | length == 0
+      when: enable_servicemonitor | bool
+    
+    # Grafana Dashboard
+    - name: Create Grafana Dashboard ConfigMap
+      block:
+        - name: Create dashboard ConfigMap
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: "{{ cluster_name }}-grafana-dashboard"
+                namespace: "{{ grafana_namespace }}"
+                labels:
+                  grafana_dashboard: "true"
+              data:
+                percona-mongodb-dashboard.json: |
+                  {
+                    "dashboard": {
+                      "title": "Percona MongoDB - {{ cluster_name }}",
+                      "tags": ["mongodb", "percona", "database"],
+                      "timezone": "browser",
+                      "panels": [
+                        {
+                          "title": "MongoDB Connections",
+                          "type": "graph",
+                          "targets": [
+                            {
+                              "expr": "mongodb_ss_connections{namespace=\"{{ mongodb_namespace }}\"}"
+                            }
+                          ]
+                        },
+                        {
+                          "title": "Query Operations/sec",
+                          "type": "graph",
+                          "targets": [
+                            {
+                              "expr": "rate(mongodb_ss_opcounters{namespace=\"{{ mongodb_namespace }}\"}[5m])"
+                            }
+                          ]
+                        },
+                        {
+                          "title": "Replication Lag",
+                          "type": "graph",
+                          "targets": [
+                            {
+                              "expr": "mongodb_rs_replication_lag_seconds{namespace=\"{{ mongodb_namespace }}\"}"
+                            }
+                          ]
+                        },
+                        {
+                          "title": "Memory Usage",
+                          "type": "graph",
+                          "targets": [
+                            {
+                              "expr": "mongodb_ss_mem_resident{namespace=\"{{ mongodb_namespace }}\"}"
+                            }
+                          ]
+                        },
+                        {
+                          "title": "Disk Usage",
+                          "type": "graph",
+                          "targets": [
+                            {
+                              "expr": "mongodb_ss_wt_cache_bytes_total{namespace=\"{{ mongodb_namespace }}\"}"
+                            }
+                          ]
+                        },
+                        {
+                          "title": "Shard Data Distribution",
+                          "type": "piechart",
+                          "targets": [
+                            {
+                              "expr": "mongodb_sharding_shard_chunks_total{namespace=\"{{ mongodb_namespace }}\"}"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  }
+        
+        - debug:
+            msg: "✅ Grafana dashboard ConfigMap created in {{ grafana_namespace }}"
+      when: enable_grafana_dashboard | bool
+      ignore_errors: true
+    
+    # Prometheus Alert Rules
+    - name: Create PrometheusRule for alerts
+      block:
+        - name: Check if PrometheusRule CRD exists
+          kubernetes.core.k8s_info:
+            api_version: apiextensions.k8s.io/v1
+            kind: CustomResourceDefinition
+            name: prometheusrules.monitoring.coreos.com
+          register: prometheusrule_crd
+        
+        - name: Create alert rules
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: monitoring.coreos.com/v1
+              kind: PrometheusRule
+              metadata:
+                name: "{{ cluster_name }}-mongodb-alerts"
+                namespace: "{{ mongodb_namespace }}"
+                labels:
+                  prometheus: k8s
+                  role: alert-rules
+              spec:
+                groups:
+                  - name: mongodb.rules
+                    interval: 30s
+                    rules:
+                      # Critical Alerts
+                      - alert: MongoDBDown
+                        expr: up{job=~".*mongodb.*", namespace="{{ mongodb_namespace }}"} == 0
+                        for: 5m
+                        labels:
+                          severity: critical
+                        annotations:
+                          summary: "MongoDB instance is down"
+                          description: "MongoDB instance {{ $labels.pod }} in {{ $labels.namespace }} has been down for more than 5 minutes"
+                      
+                      - alert: MongoDBReplicationLag
+                        expr: mongodb_rs_replication_lag_seconds{namespace="{{ mongodb_namespace }}"} > 10
+                        for: 5m
+                        labels:
+                          severity: critical
+                        annotations:
+                          summary: "MongoDB replication lag is high"
+                          description: "Replication lag is {{ $value }} seconds on {{ $labels.pod }}"
+                      
+                      - alert: MongoDBReplicationHeartbeatFailed
+                        expr: mongodb_rs_member_health{namespace="{{ mongodb_namespace }}"} == 0
+                        for: 2m
+                        labels:
+                          severity: critical
+                        annotations:
+                          summary: "MongoDB replication heartbeat failed"
+                          description: "Replication heartbeat failed for {{ $labels.pod }}"
+                      
+                      - alert: MongoDBConnectionsHigh
+                        expr: mongodb_ss_connections{conn_type="current", namespace="{{ mongodb_namespace }}"} > 5000
+                        for: 5m
+                        labels:
+                          severity: warning
+                        annotations:
+                          summary: "MongoDB connections are high"
+                          description: "Current connections: {{ $value }} on {{ $labels.pod }}"
+                      
+                      # Warning Alerts
+                      - alert: MongoDBCursorTimeout
+                        expr: increase(mongodb_ss_metrics_cursor_timedOut{namespace="{{ mongodb_namespace }}"}[5m]) > 10
+                        for: 5m
+                        labels:
+                          severity: warning
+                        annotations:
+                          summary: "MongoDB cursor timeouts increasing"
+                          description: "Cursor timeouts: {{ $value }} on {{ $labels.pod }}"
+                      
+                      - alert: MongoDBTooManyConnections
+                        expr: mongodb_ss_connections{conn_type="current", namespace="{{ mongodb_namespace }}"} / mongodb_ss_connections{conn_type="available", namespace="{{ mongodb_namespace }}"} > 0.8
+                        for: 5m
+                        labels:
+                          severity: warning
+                        annotations:
+                          summary: "MongoDB connection usage is high"
+                          description: "Connection usage is {{ $value | humanizePercentage }} on {{ $labels.pod }}"
+                      
+                      - alert: MongoDBHighMemoryUsage
+                        expr: mongodb_ss_mem_resident{namespace="{{ mongodb_namespace }}"} > 8589934592
+                        for: 10m
+                        labels:
+                          severity: warning
+                        annotations:
+                          summary: "MongoDB memory usage is high"
+                          description: "Memory usage: {{ $value | humanize }}B on {{ $labels.pod }}"
+                      
+                      - alert: MongoDBSlowQueries
+                        expr: rate(mongodb_ss_opcounters{legacy_op_type="query", namespace="{{ mongodb_namespace }}"}[5m]) > 1000
+                        for: 10m
+                        labels:
+                          severity: warning
+                        annotations:
+                          summary: "MongoDB has many slow queries"
+                          description: "Query rate: {{ $value }} ops/sec on {{ $labels.pod }}"
+                      
+                      - alert: MongoDBBackupFailed
+                        expr: psmdb_backup_status{status="error", namespace="{{ mongodb_namespace }}"} == 1
+                        for: 1m
+                        labels:
+                          severity: critical
+                        annotations:
+                          summary: "MongoDB backup failed"
+                          description: "Backup {{ $labels.backup }} failed in {{ $labels.namespace }}"
+          when: prometheusrule_crd.resources | length > 0
+        
+        - debug:
+            msg: "✅ Alert rules created for MongoDB monitoring"
+          when: prometheusrule_crd.resources | length > 0
+        
+        - debug:
+            msg: "⚠️  PrometheusRule CRD not found - alerts not created"
+          when: prometheusrule_crd.resources | length == 0
+      when: enable_alerts | bool
+    
+    # Network Policy for metrics
+    - name: Create NetworkPolicy for metrics access
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: "{{ cluster_name }}-allow-metrics"
+            namespace: "{{ mongodb_namespace }}"
+          spec:
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/instance: "{{ cluster_name }}"
+            policyTypes:
+              - Ingress
+            ingress:
+              - from:
+                  - namespaceSelector:
+                      matchLabels:
+                        name: "{{ prometheus_namespace }}"
+                ports:
+                  - protocol: TCP
+                    port: "{{ metrics_port }}"
+    
+    # Create monitoring namespace if needed
+    - name: Ensure monitoring namespace exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: mongodb-monitoring
+            labels:
+              monitoring: enabled
+      ignore_errors: true
+    
+    # Health check service
+    - name: Create health check service
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ cluster_name }}-health"
+            namespace: "{{ mongodb_namespace }}"
+            labels:
+              app: mongodb-health
+          spec:
+            type: ClusterIP
+            ports:
+              - port: 27017
+                targetPort: 27017
+                protocol: TCP
+                name: mongodb
+            selector:
+              app.kubernetes.io/instance: "{{ cluster_name }}"
+              app.kubernetes.io/component: mongos
+    
+    - name: Wait for monitoring components to be ready
+      pause:
+        seconds: 10
+    
+    - name: Get final monitoring status
+      kubernetes.core.k8s_info:
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: final_status
+    
+    - name: Display monitoring setup results
+      debug:
+        msg:
+          - "=========================================="
+          - "Production Monitoring Setup Complete"
+          - "=========================================="
+          - "Cluster: {{ cluster_name }}"
+          - "Namespace: {{ mongodb_namespace }}"
+          - ""
+          - "Deployed Components:"
+          - "  ✅ PMM Integration: {{ 'Enabled' if enable_pmm else 'Disabled' }}"
+          - "  ✅ ServiceMonitor: {{ 'Created' if enable_servicemonitor else 'Disabled' }}"
+          - "  ✅ Grafana Dashboard: {{ 'Created' if enable_grafana_dashboard else 'Disabled' }}"
+          - "  ✅ Alert Rules: {{ 'Created' if enable_alerts else 'Disabled' }}"
+          - "  ✅ NetworkPolicy: Created"
+          - "  ✅ Health Check Service: Created"
+          - ""
+          - "Access Points:"
+          - "  Metrics: {{ cluster_name }}-mongos:{{ metrics_port }}/metrics"
+          - "  Health: {{ cluster_name }}-health:27017"
+          - "{% if enable_pmm %}"
+          - "  PMM Dashboard: {{ pmm_server_url }}"
+          - "{% endif %}"
+          - ""
+          - "Next Steps:"
+          - "  1. Access Grafana dashboard in {{ grafana_namespace }} namespace"
+          - "  2. Configure AlertManager for alert notifications"
+          - "  3. Set up alert routing rules"
+          - "  4. Test alerts with: kubectl patch prometheusrule"
+          - "  5. Monitor Prometheus targets: check ServiceMonitor"
+          - ""
+          - "Verify Metrics:"
+          - "  oc port-forward -n {{ mongodb_namespace }} svc/{{ cluster_name }}-mongos {{ metrics_port }}:{{ metrics_port }}"
+          - "  curl http://localhost:{{ metrics_port }}/metrics"
+          - "=========================================="

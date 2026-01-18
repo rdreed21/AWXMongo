@@ -1,0 +1,108 @@
+---
+- name: Delete Percona MongoDB Cluster
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    mongodb_namespace: percona-mongo
+    cluster_name: mongo-cluster
+    delete_namespace: false
+    delete_pvcs: false
+  
+  tasks:
+    - name: Confirm deletion
+      pause:
+        prompt: "Are you sure you want to delete the MongoDB cluster '{{ cluster_name }}' in namespace '{{ mongodb_namespace }}'? (yes/no)"
+      register: confirm_delete
+    
+    - name: Abort if not confirmed
+      fail:
+        msg: "Deletion cancelled by user"
+      when: confirm_delete.user_input | lower != 'yes'
+    
+    - name: Delete MongoDB cluster
+      kubernetes.core.k8s:
+        state: absent
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+        wait: true
+        wait_timeout: 300
+    
+    - name: Delete MinIO deployment
+      kubernetes.core.k8s:
+        state: absent
+        api_version: apps/v1
+        kind: Deployment
+        name: minio
+        namespace: "{{ mongodb_namespace }}"
+      ignore_errors: true
+    
+    - name: Delete MinIO service
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Service
+        name: minio
+        namespace: "{{ mongodb_namespace }}"
+      ignore_errors: true
+    
+    - name: Delete MinIO route
+      kubernetes.core.k8s:
+        state: absent
+        api_version: route.openshift.io/v1
+        kind: Route
+        name: minio-console
+        namespace: "{{ mongodb_namespace }}"
+      ignore_errors: true
+    
+    - name: Delete PVCs if requested
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: PersistentVolumeClaim
+        namespace: "{{ mongodb_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/instance={{ cluster_name }}
+      when: delete_pvcs | bool
+    
+    - name: Delete MinIO PVC if requested
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: minio-pvc
+        namespace: "{{ mongodb_namespace }}"
+      when: delete_pvcs | bool
+      ignore_errors: true
+    
+    - name: Delete secrets
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: "{{ item }}"
+        namespace: "{{ mongodb_namespace }}"
+      loop:
+        - mongo-users-secret
+        - mongo-key
+        - minio-secret
+      ignore_errors: true
+    
+    - name: Delete namespace if requested
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "{{ mongodb_namespace }}"
+        wait: true
+        wait_timeout: 300
+      when: delete_namespace | bool
+    
+    - name: Display deletion summary
+      debug:
+        msg:
+          - "MongoDB cluster '{{ cluster_name }}' deleted from namespace '{{ mongodb_namespace }}'"
+          - "PVCs deleted: {{ delete_pvcs }}"
+          - "Namespace deleted: {{ delete_namespace }}"

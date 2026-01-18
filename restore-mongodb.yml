@@ -1,0 +1,87 @@
+---
+- name: Restore MongoDB from Backup
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    mongodb_namespace: percona-mongo
+    cluster_name: mongo-cluster
+    backup_name: ""  # Must be provided via extra vars or prompt
+    pitr_enabled: false
+    pitr_date: ""  # Format: "2026-01-16T14:30:00Z"
+  
+  tasks:
+    - name: Verify backup name is provided
+      fail:
+        msg: "backup_name must be provided. Use -e backup_name=<backup_name>"
+      when: backup_name == ""
+    
+    - name: Check if backup exists
+      kubernetes.core.k8s_info:
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDBBackup
+        name: "{{ backup_name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: backup_check
+      failed_when: backup_check.resources | length == 0
+    
+    - name: Generate restore name with timestamp
+      set_fact:
+        restore_name: "restore-{{ ansible_date_time.epoch }}"
+    
+    - name: Create restore without PITR
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: psmdb.percona.com/v1
+          kind: PerconaServerMongoDBRestore
+          metadata:
+            name: "{{ restore_name }}"
+            namespace: "{{ mongodb_namespace }}"
+          spec:
+            clusterName: "{{ cluster_name }}"
+            backupName: "{{ backup_name }}"
+      when: not pitr_enabled | bool
+    
+    - name: Create restore with PITR
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: psmdb.percona.com/v1
+          kind: PerconaServerMongoDBRestore
+          metadata:
+            name: "{{ restore_name }}"
+            namespace: "{{ mongodb_namespace }}"
+          spec:
+            clusterName: "{{ cluster_name }}"
+            backupName: "{{ backup_name }}"
+            pitr:
+              type: date
+              date: "{{ pitr_date }}"
+      when: 
+        - pitr_enabled | bool
+        - pitr_date != ""
+    
+    - name: Monitor restore progress
+      kubernetes.core.k8s_info:
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDBRestore
+        name: "{{ restore_name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: restore_status
+      until:
+        - restore_status.resources | length > 0
+        - restore_status.resources[0].status.state | default('') in ['ready', 'error']
+      retries: 60
+      delay: 10
+      ignore_errors: true
+    
+    - name: Display restore results
+      debug:
+        msg:
+          - "Restore Name: {{ restore_name }}"
+          - "Backup Used: {{ backup_name }}"
+          - "PITR Enabled: {{ pitr_enabled }}"
+          - "PITR Date: {{ pitr_date | default('N/A') }}"
+          - "Status: {{ restore_status.resources[0].status.state | default('unknown') }}"
+          - "Check status with: oc get psmdb-restore {{ restore_name }} -n {{ mongodb_namespace }}"

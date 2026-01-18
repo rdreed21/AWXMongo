@@ -1,0 +1,41 @@
+---
+# Development Environment Variables
+mongodb_namespace: percona-mongo-dev
+cluster_name: mongo-cluster-dev
+
+# Smaller resource footprint for dev
+config_server_size: 1
+mongos_size: 1
+shard_count: 3
+shard_replica_size: 1
+
+# Reduced resources for single-node dev
+config_cpu_limit: "250m"
+config_memory_limit: "256Mi"
+config_cpu_request: "100m"
+config_memory_request: "128Mi"
+
+mongos_cpu_limit: "250m"
+mongos_memory_limit: "256Mi"
+mongos_cpu_request: "100m"
+mongos_memory_request: "128Mi"
+
+shard_cpu_limit: "500m"
+shard_memory_limit: "512Mi"
+shard_cpu_request: "250m"
+shard_memory_request: "256Mi"
+
+# Smaller storage for dev
+config_storage: "1Gi"
+shard_storage: "2Gi"
+backup_storage: "5Gi"
+minio_storage: "10Gi"
+
+# Keep MinIO for dev
+deploy_minio: true
+enable_backups: true
+enable_pitr: false
+
+# Less frequent backups in dev
+daily_backup_schedule: "0 3 * * *"
+daily_backup_retention: 3

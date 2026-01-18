@@ -1,0 +1,269 @@
+---
+- name: Scale Percona MongoDB Cluster
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    mongodb_namespace: percona-mongo
+    cluster_name: mongo-cluster
+    
+    # Scale targets (set to desired sizes)
+    config_server_size: 3
+    mongos_size: 3
+    
+    # Shard scaling - set to desired replica count per shard
+    shard_replica_size: 3
+    
+    # Advanced: Add new shards (requires manual shard addition after)
+    add_new_shard: false
+    new_shard_name: ""  # e.g., "rs3"
+    new_shard_replica_size: 3
+    
+    # Resource limits for new shard (if adding)
+    shard_cpu_limit: "1000m"
+    shard_memory_limit: "1Gi"
+    shard_cpu_request: "500m"
+    shard_memory_request: "512Mi"
+    shard_storage: "5Gi"
+    node_architecture: "arm64"
+  
+  tasks:
+    - name: Get current cluster configuration
+      kubernetes.core.k8s_info:
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: current_cluster
+      failed_when: current_cluster.resources | length == 0
+    
+    - name: Store current configuration
+      set_fact:
+        current_config_size: "{{ current_cluster.resources[0].spec.sharding.configsvrReplSet.size }}"
+        current_mongos_size: "{{ current_cluster.resources[0].spec.sharding.mongos.size }}"
+        current_shards: "{{ current_cluster.resources[0].spec.replsets }}"
+    
+    - name: Display current cluster state
+      debug:
+        msg:
+          - "Current Configuration:"
+          - "  Config Servers: {{ current_config_size }}"
+          - "  Mongos Routers: {{ current_mongos_size }}"
+          - "  Shards: {{ current_shards | length }}"
+          - "  Shard replicas: {{ current_shards | map(attribute='size') | list }}"
+          - ""
+          - "Target Configuration:"
+          - "  Config Servers: {{ config_server_size }}"
+          - "  Mongos Routers: {{ mongos_size }}"
+          - "  Shard replicas: {{ shard_replica_size }}"
+          - "  Add new shard: {{ add_new_shard }}"
+    
+    - name: Confirm scaling operation
+      pause:
+        prompt: |
+          
+          This will scale the MongoDB cluster. Review the changes above.
+          
+          ⚠️  CAUTION:
+          - Scaling down can cause data migration
+          - Ensure sufficient cluster resources before scaling up
+          - Backup recommended before major changes
+          
+          Continue with scaling? (yes/no)
+      register: confirm_scale
+      when: not ansible_check_mode
+    
+    - name: Abort if not confirmed
+      fail:
+        msg: "Scaling cancelled by user"
+      when: 
+        - not ansible_check_mode
+        - confirm_scale.user_input | lower != 'yes'
+    
+    - name: Scale config servers
+      kubernetes.core.k8s:
+        state: patched
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+        definition:
+          spec:
+            sharding:
+              configsvrReplSet:
+                size: "{{ config_server_size }}"
+      when: config_server_size | int != current_config_size | int
+      register: config_scaled
+    
+    - name: Scale mongos routers
+      kubernetes.core.k8s:
+        state: patched
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+        definition:
+          spec:
+            sharding:
+              mongos:
+                size: "{{ mongos_size }}"
+      when: mongos_size | int != current_mongos_size | int
+      register: mongos_scaled
+    
+    - name: Scale existing shards
+      kubernetes.core.k8s:
+        state: patched
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+        definition:
+          spec:
+            replsets: "{{ updated_replsets }}"
+      vars:
+        updated_replsets: |
+          {% set ns = namespace(replsets=[]) %}
+          {% for shard in current_shards %}
+          {% set _ = ns.replsets.append({
+              'name': shard.name,
+              'size': shard_replica_size,
+              'affinity': shard.affinity,
+              'podDisruptionBudget': shard.podDisruptionBudget,
+              'expose': shard.expose,
+              'resources': shard.resources,
+              'volumeSpec': shard.volumeSpec,
+              'nonvoting': shard.nonvoting,
+              'arbiter': shard.arbiter
+          }) %}
+          {% endfor %}
+          {{ ns.replsets }}
+      when: 
+        - current_shards | length > 0
+        - not add_new_shard | bool
+      register: shards_scaled
+    
+    - name: Validate new shard name
+      fail:
+        msg: "new_shard_name must be provided when add_new_shard is true"
+      when:
+        - add_new_shard | bool
+        - new_shard_name == ""
+    
+    - name: Check if shard name already exists
+      fail:
+        msg: "Shard name '{{ new_shard_name }}' already exists"
+      when:
+        - add_new_shard | bool
+        - new_shard_name in (current_shards | map(attribute='name') | list)
+    
+    - name: Add new shard to cluster
+      kubernetes.core.k8s:
+        state: patched
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+        definition:
+          spec:
+            replsets: "{{ updated_replsets_with_new }}"
+      vars:
+        new_shard:
+          name: "{{ new_shard_name }}"
+          size: "{{ new_shard_replica_size }}"
+          affinity:
+            antiAffinityTopologyKey: "kubernetes.io/hostname"
+            advanced:
+              nodeAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - key: kubernetes.io/arch
+                          operator: In
+                          values:
+                            - "{{ node_architecture }}"
+          podDisruptionBudget:
+            maxUnavailable: 1
+          expose:
+            enabled: false
+          resources:
+            limits:
+              cpu: "{{ shard_cpu_limit }}"
+              memory: "{{ shard_memory_limit }}"
+            requests:
+              cpu: "{{ shard_cpu_request }}"
+              memory: "{{ shard_memory_request }}"
+          volumeSpec:
+            persistentVolumeClaim:
+              resources:
+                requests:
+                  storage: "{{ shard_storage }}"
+          nonvoting:
+            enabled: false
+            size: 0
+          arbiter:
+            enabled: false
+            size: 0
+        updated_replsets_with_new: "{{ current_shards + [new_shard] }}"
+      when: add_new_shard | bool
+      register: new_shard_added
+    
+    - name: Wait for scaling to begin
+      pause:
+        seconds: 10
+      when: config_scaled.changed or mongos_scaled.changed or shards_scaled.changed or new_shard_added.changed
+    
+    - name: Monitor scaling progress
+      kubernetes.core.k8s_info:
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: scaling_status
+      until:
+        - scaling_status.resources | length > 0
+        - scaling_status.resources[0].status.state | default('') == 'ready'
+      retries: 60
+      delay: 30
+      ignore_errors: true
+    
+    - name: Get pod status
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ mongodb_namespace }}"
+        label_selectors:
+          - app.kubernetes.io/instance={{ cluster_name }}
+      register: pod_status
+    
+    - name: Display scaling results
+      debug:
+        msg:
+          - "=========================================="
+          - "Scaling Operation Complete"
+          - "=========================================="
+          - "Cluster Status: {{ scaling_status.resources[0].status.state | default('unknown') }}"
+          - ""
+          - "Final Configuration:"
+          - "  Config Servers: {{ scaling_status.resources[0].spec.sharding.configsvrReplSet.size }}"
+          - "  Mongos Routers: {{ scaling_status.resources[0].spec.sharding.mongos.size }}"
+          - "  Shards: {{ scaling_status.resources[0].spec.replsets | length }}"
+          - ""
+          - "Pod Status:"
+          - "  Total Pods: {{ pod_status.resources | length }}"
+          - "  Running: {{ pod_status.resources | selectattr('status.phase', 'equalto', 'Running') | list | length }}"
+          - "  Pending: {{ pod_status.resources | selectattr('status.phase', 'equalto', 'Pending') | list | length }}"
+          - ""
+          - "Next Steps:"
+          - "{% if add_new_shard and new_shard_added.changed %}"
+          - "  ⚠️  New shard added but not yet enabled for data!"
+          - "  Run this in MongoDB to enable the new shard:"
+          - "    sh.addShard('{{ new_shard_name }}/{{ cluster_name }}-{{ new_shard_name }}-0.{{ cluster_name }}-{{ new_shard_name }}.{{ mongodb_namespace }}.svc.cluster.local:27017')"
+          - "{% endif %}"
+          - "  Monitor cluster: oc get pods -n {{ mongodb_namespace }}"
+          - "  Check shards: mongosh and run sh.status()"
+          - "=========================================="
+    
+    - name: Check for any failed pods
+      debug:
+        msg: "⚠️  Warning: Some pods are not in Running state. Check: oc get pods -n {{ mongodb_namespace }}"
+      when: (pod_status.resources | selectattr('status.phase', 'equalto', 'Running') | list | length) < (pod_status.resources | length)

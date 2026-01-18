@@ -1,0 +1,51 @@
+---
+# Production Environment Variables
+mongodb_namespace: percona-mongo-prod
+cluster_name: mongo-cluster-prod
+
+# Full HA configuration
+config_server_size: 3
+mongos_size: 3
+shard_count: 3
+shard_replica_size: 3
+
+# Production resource allocations
+config_cpu_limit: "1000m"
+config_memory_limit: "1Gi"
+config_cpu_request: "500m"
+config_memory_request: "512Mi"
+
+mongos_cpu_limit: "1000m"
+mongos_memory_limit: "1Gi"
+mongos_cpu_request: "500m"
+mongos_memory_request: "512Mi"
+
+shard_cpu_limit: "2000m"
+shard_memory_limit: "2Gi"
+shard_cpu_request: "1000m"
+shard_memory_request: "1Gi"
+
+# Production storage sizes
+config_storage: "10Gi"
+shard_storage: "50Gi"
+backup_storage: "100Gi"
+minio_storage: "200Gi"
+
+# Enable all features in production
+deploy_minio: true
+enable_backups: true
+enable_pitr: true
+
+# Production backup schedules
+daily_backup_schedule: "0 2 * * *"
+daily_backup_retention: 7
+weekly_backup_schedule: "0 3 * * 0"
+weekly_backup_retention: 4
+
+# Use production-grade credentials (should be in vault!)
+mongodb_backup_password: "{{ vault_mongodb_backup_password }}"
+mongodb_cluster_admin_password: "{{ vault_mongodb_cluster_admin_password }}"
+mongodb_cluster_monitor_password: "{{ vault_mongodb_cluster_monitor_password }}"
+mongodb_user_admin_password: "{{ vault_mongodb_user_admin_password }}"
+minio_access_key: "{{ vault_minio_access_key }}"
+minio_secret_key: "{{ vault_minio_secret_key }}"

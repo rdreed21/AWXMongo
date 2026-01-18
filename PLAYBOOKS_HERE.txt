@@ -1,0 +1,40 @@
+================================================================================
+COPY REQUIRED PLAYBOOK FILES HERE
+================================================================================
+
+This bundle requires the following playbook files from Claude artifacts:
+
+REQUIRED PLAYBOOKS (8 files):
+1.  deploy-percona-mongodb.yml     - Main cluster deployment
+2.  backup-mongodb.yml             - Manual backup trigger
+3.  restore-mongodb.yml            - Restore from backup
+4.  delete-mongodb.yml             - Cluster cleanup
+5.  scale-mongodb.yml              - Scale cluster components
+6.  upgrade-mongodb.yml            - Upgrade MongoDB versions
+7.  setup-monitoring.yml           - Production monitoring (prod only)
+8.  tune-mongodb.yml               - Performance tuning
+9.  README-AWX.md                  - Complete documentation
+
+Copy all 9 files from the Claude artifacts into this directory.
+
+Once copied, your directory structure should look like:
+
+percona-mongodb-ansible/
+├── ansible.cfg
+├── inventory.yml
+├── requirements.yml
+├── deploy-percona-mongodb.yml       ← COPY THIS
+├── backup-mongodb.yml               ← COPY THIS
+├── restore-mongodb.yml              ← COPY THIS
+├── delete-mongodb.yml               ← COPY THIS
+├── scale-mongodb.yml                ← COPY THIS
+├── upgrade-mongodb.yml              ← COPY THIS
+├── setup-monitoring.yml             ← COPY THIS
+├── tune-mongodb.yml                 ← COPY THIS
+├── README-AWX.md                    ← COPY THIS
+└── group_vars/
+    ├── dev.yml
+    └── prod.yml
+
+After copying all files, you can delete this PLAYBOOKS_HERE.txt file.
+================================================================================

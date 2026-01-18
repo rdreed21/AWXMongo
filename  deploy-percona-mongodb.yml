@@ -1,0 +1,574 @@
+---
+- name: Deploy Percona MongoDB Sharded Cluster on OpenShift
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    # Namespace configuration
+    mongodb_namespace: percona-mongo
+    
+    # Cluster configuration
+    cluster_name: mongo-cluster
+    operator_version: "1.21.1"
+    mongodb_version: "8.0.12-4-multi"
+    backup_version: "2.11.0-multi"
+    
+    # Replica sizes
+    config_server_size: 3
+    mongos_size: 3
+    shard_count: 3
+    shard_replica_size: 3
+    
+    # Resource limits
+    config_cpu_limit: "500m"
+    config_memory_limit: "512Mi"
+    config_cpu_request: "250m"
+    config_memory_request: "256Mi"
+    
+    mongos_cpu_limit: "500m"
+    mongos_memory_limit: "512Mi"
+    mongos_cpu_request: "250m"
+    mongos_memory_request: "256Mi"
+    
+    shard_cpu_limit: "1000m"
+    shard_memory_limit: "1Gi"
+    shard_cpu_request: "500m"
+    shard_memory_request: "512Mi"
+    
+    # Storage sizes
+    config_storage: "3Gi"
+    shard_storage: "5Gi"
+    backup_storage: "10Gi"
+    minio_storage: "20Gi"
+    
+    # Credentials (CHANGE THESE IN PRODUCTION!)
+    mongodb_backup_password: "backup123456"
+    mongodb_cluster_admin_password: "clusterAdmin123456"
+    mongodb_cluster_monitor_password: "clusterMonitor123456"
+    mongodb_user_admin_password: "userAdmin123456"
+    mongodb_key: "8KVZhigHqt8lL8Xf0sTqZpHPP1qgqGxmJEqLqGqLgHhGJHFJKjhjkHJKjkHJKjhkjHKJHkjhKJHkjhKJHkjhKJHkjhKJHkjhKJHkjhKJHkjhKJHkjhKJHkjhKJHkjhKJHkj"
+    
+    # MinIO credentials
+    minio_access_key: "minioadmin"
+    minio_secret_key: "minioadmin123456"
+    
+    # Feature flags
+    deploy_minio: true
+    enable_backups: true
+    enable_pitr: true
+    
+    # Backup schedules
+    daily_backup_schedule: "0 2 * * *"
+    daily_backup_retention: 7
+    weekly_backup_schedule: "0 3 * * 0"
+    weekly_backup_retention: 4
+    
+    # Architecture
+    node_architecture: "arm64"
+    
+  tasks:
+    - name: Create namespace
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ mongodb_namespace }}"
+    
+    - name: Create OperatorGroup
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1
+          kind: OperatorGroup
+          metadata:
+            name: percona-mongo-operator-group
+            namespace: "{{ mongodb_namespace }}"
+          spec:
+            targetNamespaces:
+              - "{{ mongodb_namespace }}"
+    
+    - name: Create Operator Subscription
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: percona-server-mongodb-operator
+            namespace: "{{ mongodb_namespace }}"
+          spec:
+            channel: stable
+            name: percona-server-mongodb-operator
+            source: certified-operators
+            sourceNamespace: openshift-marketplace
+            installPlanApproval: Automatic
+    
+    - name: Wait for operator to be ready
+      kubernetes.core.k8s_info:
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ mongodb_namespace }}"
+      register: csv_list
+      until: 
+        - csv_list.resources | length > 0
+        - csv_list.resources[0].status.phase == "Succeeded"
+      retries: 30
+      delay: 10
+    
+    - name: Create MongoDB users secret
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: mongo-users-secret
+            namespace: "{{ mongodb_namespace }}"
+          type: Opaque
+          stringData:
+            MONGODB_BACKUP_USER: backup
+            MONGODB_BACKUP_PASSWORD: "{{ mongodb_backup_password }}"
+            MONGODB_CLUSTER_ADMIN_USER: clusterAdmin
+            MONGODB_CLUSTER_ADMIN_PASSWORD: "{{ mongodb_cluster_admin_password }}"
+            MONGODB_CLUSTER_MONITOR_USER: clusterMonitor
+            MONGODB_CLUSTER_MONITOR_PASSWORD: "{{ mongodb_cluster_monitor_password }}"
+            MONGODB_USER_ADMIN_USER: userAdmin
+            MONGODB_USER_ADMIN_PASSWORD: "{{ mongodb_user_admin_password }}"
+    
+    - name: Create MongoDB encryption key secret
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: mongo-key
+            namespace: "{{ mongodb_namespace }}"
+          type: Opaque
+          stringData:
+            mongodb-key: "{{ mongodb_key }}"
+    
+    - name: Create MinIO credentials secret
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: minio-secret
+            namespace: "{{ mongodb_namespace }}"
+          type: Opaque
+          stringData:
+            AWS_ACCESS_KEY_ID: "{{ minio_access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ minio_secret_key }}"
+      when: deploy_minio | bool
+    
+    - name: Deploy MinIO PVC
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: minio-pvc
+            namespace: "{{ mongodb_namespace }}"
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: "{{ minio_storage }}"
+      when: deploy_minio | bool
+    
+    - name: Deploy MinIO
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: minio
+            namespace: "{{ mongodb_namespace }}"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: minio
+            template:
+              metadata:
+                labels:
+                  app: minio
+              spec:
+                containers:
+                  - name: minio
+                    image: quay.io/minio/minio:latest
+                    args:
+                      - server
+                      - /data
+                      - --console-address
+                      - ":9001"
+                    env:
+                      - name: MINIO_ROOT_USER
+                        value: "{{ minio_access_key }}"
+                      - name: MINIO_ROOT_PASSWORD
+                        value: "{{ minio_secret_key }}"
+                    ports:
+                      - containerPort: 9000
+                        name: api
+                      - containerPort: 9001
+                        name: console
+                    volumeMounts:
+                      - name: data
+                        mountPath: /data
+                    resources:
+                      limits:
+                        cpu: "500m"
+                        memory: "512Mi"
+                      requests:
+                        cpu: "250m"
+                        memory: "256Mi"
+                volumes:
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: minio-pvc
+      when: deploy_minio | bool
+    
+    - name: Create MinIO Service
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: minio
+            namespace: "{{ mongodb_namespace }}"
+          spec:
+            type: ClusterIP
+            ports:
+              - port: 9000
+                targetPort: 9000
+                name: api
+              - port: 9001
+                targetPort: 9001
+                name: console
+            selector:
+              app: minio
+      when: deploy_minio | bool
+    
+    - name: Create MinIO Console Route
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: minio-console
+            namespace: "{{ mongodb_namespace }}"
+          spec:
+            to:
+              kind: Service
+              name: minio
+            port:
+              targetPort: console
+            tls:
+              termination: edge
+              insecureEdgeTerminationPolicy: Redirect
+      when: deploy_minio | bool
+    
+    - name: Wait for MinIO to be ready
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: minio
+        namespace: "{{ mongodb_namespace }}"
+      register: minio_deployment
+      until:
+        - minio_deployment.resources | length > 0
+        - minio_deployment.resources[0].status.availableReplicas | default(0) > 0
+      retries: 20
+      delay: 10
+      when: deploy_minio | bool
+    
+    - name: Deploy Percona MongoDB Cluster
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: psmdb.percona.com/v1
+          kind: PerconaServerMongoDB
+          metadata:
+            name: "{{ cluster_name }}"
+            namespace: "{{ mongodb_namespace }}"
+            finalizers:
+              - delete-psmdb-pods-in-order
+          spec:
+            crVersion: "{{ operator_version }}"
+            image: "percona/percona-server-mongodb:{{ mongodb_version }}"
+            imagePullPolicy: Always
+            secrets:
+              users: mongo-users-secret
+              encryptionKey: mongo-key
+            updateStrategy: SmartUpdate
+            upgradeOptions:
+              versionServiceEndpoint: https://check.percona.com
+              apply: disabled
+              schedule: "0 2 * * *"
+            sharding:
+              enabled: true
+              configsvrReplSet:
+                size: "{{ config_server_size }}"
+                affinity:
+                  antiAffinityTopologyKey: "kubernetes.io/hostname"
+                  advanced:
+                    nodeAffinity:
+                      requiredDuringSchedulingIgnoredDuringExecution:
+                        nodeSelectorTerms:
+                          - matchExpressions:
+                              - key: kubernetes.io/arch
+                                operator: In
+                                values:
+                                  - "{{ node_architecture }}"
+                podDisruptionBudget:
+                  maxUnavailable: 1
+                expose:
+                  enabled: false
+                resources:
+                  limits:
+                    cpu: "{{ config_cpu_limit }}"
+                    memory: "{{ config_memory_limit }}"
+                  requests:
+                    cpu: "{{ config_cpu_request }}"
+                    memory: "{{ config_memory_request }}"
+                volumeSpec:
+                  persistentVolumeClaim:
+                    resources:
+                      requests:
+                        storage: "{{ config_storage }}"
+              mongos:
+                size: "{{ mongos_size }}"
+                affinity:
+                  antiAffinityTopologyKey: "kubernetes.io/hostname"
+                  advanced:
+                    nodeAffinity:
+                      requiredDuringSchedulingIgnoredDuringExecution:
+                        nodeSelectorTerms:
+                          - matchExpressions:
+                              - key: kubernetes.io/arch
+                                operator: In
+                                values:
+                                  - "{{ node_architecture }}"
+                podDisruptionBudget:
+                  maxUnavailable: 1
+                expose:
+                  exposeType: ClusterIP
+                resources:
+                  limits:
+                    cpu: "{{ mongos_cpu_limit }}"
+                    memory: "{{ mongos_memory_limit }}"
+                  requests:
+                    cpu: "{{ mongos_cpu_request }}"
+                    memory: "{{ mongos_memory_request }}"
+            replsets:
+              - name: rs0
+                size: "{{ shard_replica_size }}"
+                affinity:
+                  antiAffinityTopologyKey: "kubernetes.io/hostname"
+                  advanced:
+                    nodeAffinity:
+                      requiredDuringSchedulingIgnoredDuringExecution:
+                        nodeSelectorTerms:
+                          - matchExpressions:
+                              - key: kubernetes.io/arch
+                                operator: In
+                                values:
+                                  - "{{ node_architecture }}"
+                podDisruptionBudget:
+                  maxUnavailable: 1
+                expose:
+                  enabled: false
+                resources:
+                  limits:
+                    cpu: "{{ shard_cpu_limit }}"
+                    memory: "{{ shard_memory_limit }}"
+                  requests:
+                    cpu: "{{ shard_cpu_request }}"
+                    memory: "{{ shard_memory_request }}"
+                volumeSpec:
+                  persistentVolumeClaim:
+                    resources:
+                      requests:
+                        storage: "{{ shard_storage }}"
+                nonvoting:
+                  enabled: false
+                  size: 0
+                arbiter:
+                  enabled: false
+                  size: 0
+              - name: rs1
+                size: "{{ shard_replica_size }}"
+                affinity:
+                  antiAffinityTopologyKey: "kubernetes.io/hostname"
+                  advanced:
+                    nodeAffinity:
+                      requiredDuringSchedulingIgnoredDuringExecution:
+                        nodeSelectorTerms:
+                          - matchExpressions:
+                              - key: kubernetes.io/arch
+                                operator: In
+                                values:
+                                  - "{{ node_architecture }}"
+                podDisruptionBudget:
+                  maxUnavailable: 1
+                expose:
+                  enabled: false
+                resources:
+                  limits:
+                    cpu: "{{ shard_cpu_limit }}"
+                    memory: "{{ shard_memory_limit }}"
+                  requests:
+                    cpu: "{{ shard_cpu_request }}"
+                    memory: "{{ shard_memory_request }}"
+                volumeSpec:
+                  persistentVolumeClaim:
+                    resources:
+                      requests:
+                        storage: "{{ shard_storage }}"
+                nonvoting:
+                  enabled: false
+                  size: 0
+                arbiter:
+                  enabled: false
+                  size: 0
+              - name: rs2
+                size: "{{ shard_replica_size }}"
+                affinity:
+                  antiAffinityTopologyKey: "kubernetes.io/hostname"
+                  advanced:
+                    nodeAffinity:
+                      requiredDuringSchedulingIgnoredDuringExecution:
+                        nodeSelectorTerms:
+                          - matchExpressions:
+                              - key: kubernetes.io/arch
+                                operator: In
+                                values:
+                                  - "{{ node_architecture }}"
+                podDisruptionBudget:
+                  maxUnavailable: 1
+                expose:
+                  enabled: false
+                resources:
+                  limits:
+                    cpu: "{{ shard_cpu_limit }}"
+                    memory: "{{ shard_memory_limit }}"
+                  requests:
+                    cpu: "{{ shard_cpu_request }}"
+                    memory: "{{ shard_memory_request }}"
+                volumeSpec:
+                  persistentVolumeClaim:
+                    resources:
+                      requests:
+                        storage: "{{ shard_storage }}"
+                nonvoting:
+                  enabled: false
+                  size: 0
+                arbiter:
+                  enabled: false
+                  size: 0
+            backup:
+              enabled: "{{ enable_backups }}"
+              image: "percona/percona-backup-mongodb:{{ backup_version }}"
+              serviceAccountName: percona-server-mongodb-operator
+              storages:
+                minio-local:
+                  type: s3
+                  s3:
+                    bucket: mongodb-backups
+                    credentialsSecret: minio-secret
+                    region: us-east-1
+                    endpointUrl: http://minio:9000
+                filesystem-local:
+                  type: filesystem
+                  filesystem:
+                    affinity:
+                      nodeAffinity:
+                        requiredDuringSchedulingIgnoredDuringExecution:
+                          nodeSelectorTerms:
+                            - matchExpressions:
+                                - key: kubernetes.io/arch
+                                  operator: In
+                                  values:
+                                    - "{{ node_architecture }}"
+                    volumeSpec:
+                      persistentVolumeClaim:
+                        resources:
+                          requests:
+                            storage: "{{ backup_storage }}"
+              pitr:
+                enabled: "{{ enable_pitr }}"
+                oplogSpanMin: 10
+                compressionType: gzip
+                compressionLevel: 6
+              tasks:
+                - name: daily-backup
+                  enabled: true
+                  schedule: "{{ daily_backup_schedule }}"
+                  keep: "{{ daily_backup_retention }}"
+                  storageName: filesystem-local
+                  compressionType: gzip
+                  compressionLevel: 6
+                - name: weekly-backup
+                  enabled: true
+                  schedule: "{{ weekly_backup_schedule }}"
+                  keep: "{{ weekly_backup_retention }}"
+                  storageName: filesystem-local
+                  compressionType: gzip
+                  compressionLevel: 6
+            pmm:
+              enabled: false
+    
+    - name: Wait for MongoDB cluster to be ready
+      kubernetes.core.k8s_info:
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: mongodb_cluster
+      until:
+        - mongodb_cluster.resources | length > 0
+        - mongodb_cluster.resources[0].status.state | default('') == 'ready'
+      retries: 60
+      delay: 30
+      ignore_errors: true
+    
+    - name: Get MongoDB cluster status
+      kubernetes.core.k8s_info:
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: final_status
+    
+    - name: Display deployment summary
+      debug:
+        msg:
+          - "=========================================="
+          - "Percona MongoDB Deployment Complete"
+          - "=========================================="
+          - "Namespace: {{ mongodb_namespace }}"
+          - "Cluster Name: {{ cluster_name }}"
+          - "MongoDB Version: {{ mongodb_version }}"
+          - "Config Servers: {{ config_server_size }}"
+          - "Mongos Routers: {{ mongos_size }}"
+          - "Shards: {{ shard_count }} ({{ shard_replica_size }} replicas each)"
+          - "Total Pods: {{ config_server_size + mongos_size + (shard_count * shard_replica_size) }}"
+          - "Backups Enabled: {{ enable_backups }}"
+          - "PITR Enabled: {{ enable_pitr }}"
+          - "MinIO Deployed: {{ deploy_minio }}"
+          - "=========================================="
+          - "Connect to MongoDB:"
+          - "  oc port-forward -n {{ mongodb_namespace }} svc/{{ cluster_name }}-mongos 27017:27017"
+          - "  mongosh 'mongodb://clusterAdmin:{{ mongodb_cluster_admin_password }}@localhost:27017/admin'"
+          - "=========================================="
+          - "Cluster Status: {{ final_status.resources[0].status.state | default('initializing') }}"
+          - "=========================================="

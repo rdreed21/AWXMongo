@@ -1,0 +1,317 @@
+---
+- name: Upgrade Percona MongoDB Cluster
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    mongodb_namespace: percona-mongo
+    cluster_name: mongo-cluster
+    
+    # Target versions (update these for upgrades)
+    target_operator_version: "1.21.1"
+    target_mongodb_version: "8.0.12-4-multi"
+    target_backup_version: "2.11.0-multi"
+    
+    # Upgrade strategy
+    upgrade_strategy: SmartUpdate  # SmartUpdate, RollingUpdate, or OnDelete
+    
+    # Safety checks
+    require_backup_before_upgrade: true
+    skip_version_check: false
+    
+    # Maintenance window
+    maintenance_window: false
+    maintenance_start: ""  # ISO 8601 format: "2026-01-20T02:00:00Z"
+    maintenance_end: ""    # ISO 8601 format: "2026-01-20T04:00:00Z"
+  
+  tasks:
+    - name: Check if maintenance window is active
+      block:
+        - name: Get current time
+          set_fact:
+            current_time: "{{ ansible_date_time.iso8601 }}"
+        
+        - name: Verify we are in maintenance window
+          fail:
+            msg: |
+              Current time {{ current_time }} is outside maintenance window.
+              Window: {{ maintenance_start }} to {{ maintenance_end }}
+          when:
+            - maintenance_window | bool
+            - current_time < maintenance_start or current_time > maintenance_end
+      when: maintenance_window | bool
+    
+    - name: Get current cluster configuration
+      kubernetes.core.k8s_info:
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: current_cluster
+      failed_when: current_cluster.resources | length == 0
+    
+    - name: Extract current versions
+      set_fact:
+        current_operator_version: "{{ current_cluster.resources[0].spec.crVersion }}"
+        current_mongodb_version: "{{ current_cluster.resources[0].spec.image | regex_replace('^.*:', '') }}"
+        current_backup_version: "{{ current_cluster.resources[0].spec.backup.image | default('') | regex_replace('^.*:', '') }}"
+        current_cluster_state: "{{ current_cluster.resources[0].status.state | default('unknown') }}"
+    
+    - name: Display version information
+      debug:
+        msg:
+          - "=========================================="
+          - "MongoDB Cluster Upgrade Plan"
+          - "=========================================="
+          - "Cluster: {{ cluster_name }}"
+          - "Namespace: {{ mongodb_namespace }}"
+          - "Current Status: {{ current_cluster_state }}"
+          - ""
+          - "Current Versions:"
+          - "  Operator CR: {{ current_operator_version }}"
+          - "  MongoDB: {{ current_mongodb_version }}"
+          - "  Backup: {{ current_backup_version }}"
+          - ""
+          - "Target Versions:"
+          - "  Operator CR: {{ target_operator_version }}"
+          - "  MongoDB: {{ target_mongodb_version }}"
+          - "  Backup: {{ target_backup_version }}"
+          - ""
+          - "Upgrade Strategy: {{ upgrade_strategy }}"
+          - "Backup Required: {{ require_backup_before_upgrade }}"
+          - "=========================================="
+    
+    - name: Check if cluster is ready for upgrade
+      fail:
+        msg: "Cluster is not in 'ready' state. Current state: {{ current_cluster_state }}"
+      when: current_cluster_state != 'ready'
+    
+    - name: Check if upgrade is needed
+      set_fact:
+        needs_upgrade: >-
+          {{ (current_operator_version != target_operator_version) or
+             (current_mongodb_version != target_mongodb_version) or
+             (current_backup_version != target_backup_version and current_backup_version != '') }}
+    
+    - name: Skip if no upgrade needed
+      block:
+        - debug:
+            msg: "Cluster is already at target versions. No upgrade needed."
+        - meta: end_play
+      when: not needs_upgrade | bool
+    
+    - name: Validate version compatibility
+      block:
+        - name: Check MongoDB version compatibility
+          fail:
+            msg: |
+              Version downgrade detected or major version jump!
+              Current: {{ current_mongodb_version }}
+              Target: {{ target_mongodb_version }}
+              
+              MongoDB upgrades must be sequential (e.g., 7.0 -> 8.0).
+              Skipping version check is dangerous.
+          when:
+            - not skip_version_check | bool
+            - target_mongodb_version is version(current_mongodb_version, '<')
+        
+        - name: Warn about major version upgrade
+          debug:
+            msg: |
+              ⚠️  WARNING: Major version upgrade detected!
+              Ensure you have reviewed the MongoDB release notes and tested in non-production.
+          when: target_mongodb_version.split('.')[0] != current_mongodb_version.split('.')[0]
+      when: current_mongodb_version != target_mongodb_version
+    
+    - name: Check for recent backups
+      block:
+        - name: Get list of backups
+          kubernetes.core.k8s_info:
+            api_version: psmdb.percona.com/v1
+            kind: PerconaServerMongoDBBackup
+            namespace: "{{ mongodb_namespace }}"
+            label_selectors:
+              - cluster={{ cluster_name }}
+          register: existing_backups
+        
+        - name: Check if recent backup exists
+          set_fact:
+            recent_backup_exists: >-
+              {{ existing_backups.resources |
+                 selectattr('status.state', 'equalto', 'ready') |
+                 list | length > 0 }}
+        
+        - name: Trigger pre-upgrade backup if needed
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: psmdb.percona.com/v1
+              kind: PerconaServerMongoDBBackup
+              metadata:
+                name: "pre-upgrade-backup-{{ ansible_date_time.epoch }}"
+                namespace: "{{ mongodb_namespace }}"
+              spec:
+                clusterName: "{{ cluster_name }}"
+                storageName: filesystem-local
+                compressionType: gzip
+                compressionLevel: 6
+          when: not recent_backup_exists
+          register: backup_created
+        
+        - name: Wait for backup to complete
+          kubernetes.core.k8s_info:
+            api_version: psmdb.percona.com/v1
+            kind: PerconaServerMongoDBBackup
+            name: "{{ backup_created.result.metadata.name }}"
+            namespace: "{{ mongodb_namespace }}"
+          register: backup_status
+          until:
+            - backup_status.resources | length > 0
+            - backup_status.resources[0].status.state | default('') in ['ready', 'error']
+          retries: 60
+          delay: 30
+          when: backup_created.changed
+        
+        - name: Fail if backup failed
+          fail:
+            msg: "Pre-upgrade backup failed. Aborting upgrade."
+          when:
+            - backup_created.changed
+            - backup_status.resources[0].status.state | default('') == 'error'
+        
+        - name: Display backup info
+          debug:
+            msg: "✅ Pre-upgrade backup completed: {{ backup_created.result.metadata.name | default('existing backup used') }}"
+          when: require_backup_before_upgrade | bool
+      when: require_backup_before_upgrade | bool
+    
+    - name: Confirm upgrade
+      pause:
+        prompt: |
+          
+          Ready to upgrade MongoDB cluster.
+          
+          ⚠️  IMPORTANT:
+          - Backup has been created (if required)
+          - Upgrade will cause rolling restart of pods
+          - Monitor the upgrade process carefully
+          - Have rollback plan ready
+          
+          Proceed with upgrade? (yes/no)
+      register: confirm_upgrade
+      when: not ansible_check_mode
+    
+    - name: Abort if not confirmed
+      fail:
+        msg: "Upgrade cancelled by user"
+      when:
+        - not ansible_check_mode
+        - confirm_upgrade.user_input | lower != 'yes'
+    
+    - name: Update cluster with new versions
+      kubernetes.core.k8s:
+        state: patched
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+        definition:
+          spec:
+            crVersion: "{{ target_operator_version }}"
+            image: "percona/percona-server-mongodb:{{ target_mongodb_version }}"
+            updateStrategy: "{{ upgrade_strategy }}"
+            backup:
+              image: "percona/percona-backup-mongodb:{{ target_backup_version }}"
+      register: upgrade_applied
+    
+    - name: Wait for upgrade to begin
+      pause:
+        seconds: 15
+      when: upgrade_applied.changed
+    
+    - name: Monitor upgrade progress
+      block:
+        - name: Check cluster status during upgrade
+          kubernetes.core.k8s_info:
+            api_version: psmdb.percona.com/v1
+            kind: PerconaServerMongoDB
+            name: "{{ cluster_name }}"
+            namespace: "{{ mongodb_namespace }}"
+          register: upgrade_status
+          until:
+            - upgrade_status.resources | length > 0
+            - upgrade_status.resources[0].status.state | default('') == 'ready'
+          retries: 120
+          delay: 30
+          ignore_errors: true
+        
+        - name: Get pod status during upgrade
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Pod
+            namespace: "{{ mongodb_namespace }}"
+            label_selectors:
+              - app.kubernetes.io/instance={{ cluster_name }}
+          register: pod_status_upgrade
+        
+        - name: Check for any errors
+          set_fact:
+            upgrade_successful: >-
+              {{ upgrade_status.resources[0].status.state | default('') == 'ready' }}
+            pods_ready: >-
+              {{ (pod_status_upgrade.resources | 
+                  selectattr('status.phase', 'equalto', 'Running') | 
+                  list | length) == (pod_status_upgrade.resources | length) }}
+      when: upgrade_applied.changed
+    
+    - name: Verify upgrade completion
+      kubernetes.core.k8s_info:
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDB
+        name: "{{ cluster_name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: final_cluster_state
+    
+    - name: Extract final versions
+      set_fact:
+        final_operator_version: "{{ final_cluster_state.resources[0].spec.crVersion }}"
+        final_mongodb_version: "{{ final_cluster_state.resources[0].spec.image | regex_replace('^.*:', '') }}"
+        final_backup_version: "{{ final_cluster_state.resources[0].spec.backup.image | default('') | regex_replace('^.*:', '') }}"
+        final_cluster_status: "{{ final_cluster_state.resources[0].status.state | default('unknown') }}"
+    
+    - name: Display upgrade results
+      debug:
+        msg:
+          - "=========================================="
+          - "MongoDB Upgrade Complete"
+          - "=========================================="
+          - "Cluster Status: {{ final_cluster_status }}"
+          - ""
+          - "Final Versions:"
+          - "  Operator CR: {{ final_operator_version }}"
+          - "  MongoDB: {{ final_mongodb_version }}"
+          - "  Backup: {{ final_backup_version }}"
+          - ""
+          - "Upgrade Results:"
+          - "  Operator: {{ 'UPGRADED' if final_operator_version == target_operator_version else 'PENDING' }}"
+          - "  MongoDB: {{ 'UPGRADED' if final_mongodb_version == target_mongodb_version else 'PENDING' }}"
+          - "  Backup: {{ 'UPGRADED' if final_backup_version == target_backup_version else 'PENDING' }}"
+          - ""
+          - "Next Steps:"
+          - "  1. Verify cluster health: oc get pods -n {{ mongodb_namespace }}"
+          - "  2. Connect to MongoDB and verify: mongosh"
+          - "  3. Run: db.version() to confirm version"
+          - "  4. Check shard status: sh.status()"
+          - "  5. Monitor logs for any warnings"
+          - "  6. Update application connection strings if needed"
+          - "=========================================="
+    
+    - name: Fail if upgrade unsuccessful
+      fail:
+        msg: |
+          Upgrade did not complete successfully!
+          Cluster Status: {{ final_cluster_status }}
+          Check logs: oc logs -n {{ mongodb_namespace }} -l app.kubernetes.io/instance={{ cluster_name }}
+      when: 
+        - upgrade_applied.changed
+        - final_cluster_status != 'ready'

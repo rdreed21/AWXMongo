@@ -1,0 +1,52 @@
+---
+- name: Trigger MongoDB Backup
+  hosts: localhost
+  gather_facts: false
+  
+  vars:
+    mongodb_namespace: percona-mongo
+    cluster_name: mongo-cluster
+    backup_storage: filesystem-local
+    backup_compression: gzip
+    backup_compression_level: 6
+  
+  tasks:
+    - name: Generate backup name with timestamp
+      set_fact:
+        backup_name: "manual-backup-{{ ansible_date_time.epoch }}"
+    
+    - name: Create manual backup
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: psmdb.percona.com/v1
+          kind: PerconaServerMongoDBBackup
+          metadata:
+            name: "{{ backup_name }}"
+            namespace: "{{ mongodb_namespace }}"
+          spec:
+            clusterName: "{{ cluster_name }}"
+            storageName: "{{ backup_storage }}"
+            compressionType: "{{ backup_compression }}"
+            compressionLevel: "{{ backup_compression_level }}"
+    
+    - name: Wait for backup to start
+      kubernetes.core.k8s_info:
+        api_version: psmdb.percona.com/v1
+        kind: PerconaServerMongoDBBackup
+        name: "{{ backup_name }}"
+        namespace: "{{ mongodb_namespace }}"
+      register: backup_status
+      until:
+        - backup_status.resources | length > 0
+        - backup_status.resources[0].status.state | default('') in ['running', 'ready', 'error']
+      retries: 10
+      delay: 5
+    
+    - name: Display backup status
+      debug:
+        msg:
+          - "Backup Name: {{ backup_name }}"
+          - "Status: {{ backup_status.resources[0].status.state | default('unknown') }}"
+          - "Storage: {{ backup_storage }}"
+          - "Check status with: oc get psmdb-backup {{ backup_name }} -n {{ mongodb_namespace }}"
